@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.18;
+
+import {Test} from "forge-std/Test.sol";
+import {OurToken} from "../src/OurToken.sol";
+import {DeployOurToken} from "../script/DeployOurToken.s.sol";
+
+contract OurTokenTest is Test {
+    OurToken public ourToken;
+    DeployOurToken public deployer;
+
+    address public owner;
+    address public bob = makeAddr("bob");
+    address public alice = makeAddr("alice");
+    address public carol = makeAddr("carol");
+
+    // Mirror ERC20 events for expectEmit
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(
+        address indexed owner,
+        address indexed spender,
+        uint256 value
+    );
+
+    uint256 public constant STARTING_BALANCE = 1_000;
+
+    function setUp() public {
+        // If your DeployOurToken.run() returns OurToken, keep this.
+        // If it does not return, replace the two lines below with:
+        // ourToken = new OurToken(1_000 ether);
+        deployer = new DeployOurToken();
+        ourToken = deployer.run();
+
+        owner = address(this);
+
+        // Fund bob from owner with a known balance
+        ourToken.transfer(bob, STARTING_BALANCE);
+    }
+
+    // --------- Constructor / metadata / supply ---------
+
+    function test_MetadataAndSupply() public {
+        assertEq(ourToken.name(), "OurToken");
+        assertEq(ourToken.symbol(), "OT");
+        assertEq(ourToken.decimals(), 18);
+
+        // Total supply should equal owner's + others; at least > 0
+        uint256 ts = ourToken.totalSupply();
+        assertGt(ts, 0);
+
+        // Owner balance is totalSupply - what was given to bob
+        assertEq(ourToken.balanceOf(owner), ts - STARTING_BALANCE);
+        assertEq(ourToken.balanceOf(bob), STARTING_BALANCE);
+    }
+
+    // --------- Transfers ---------
+
+    function test_TransferUpdatesBalancesAndEmits() public {
+        uint256 amount = 123 ether;
+
+        vm.expectEmit(true, true, false, true);
+        emit Transfer(owner, alice, amount);
+
+        bool ok = ourToken.transfer(alice, amount);
+        assertTrue(ok);
+
+        assertEq(ourToken.balanceOf(alice), amount);
+        // Owner’s balance decreased by amount
+        uint256 ts = ourToken.totalSupply();
+        assertEq(ourToken.balanceOf(owner), ts - STARTING_BALANCE - amount);
+    }
+
+    function test_TransferReverts_InsufficientBalance() public {
+        vm.prank(alice); // alice has 0
+        vm.expectRevert(bytes("ERC20: transfer amount exceeds balance"));
+        ourToken.transfer(bob, 1);
+    }
+
+    function test_TransferReverts_ToZeroAddress() public {
+        vm.expectRevert(bytes("ERC20: transfer to the zero address"));
+        ourToken.transfer(address(0), 1);
+    }
+
+    // --------- Allowances / Approvals ---------
+
+    function test_ApproveSetsAllowanceAndEmits() public {
+        uint256 allowanceAmount = 500 ether;
+
+        vm.expectEmit(true, true, false, true);
+        emit Approval(owner, alice, allowanceAmount);
+
+        bool ok = ourToken.approve(alice, allowanceAmount);
+        assertTrue(ok);
+        assertEq(ourToken.allowance(owner, alice), allowanceAmount);
+    }
+
+    function test_TransferFromSpendsAllowanceAndEmits() public {
+        // Bob will delegate to Alice; Alice pulls from Bob to herself
+        uint256 initialAllowance = 600;
+        uint256 transferAmount = 250;
+
+        vm.prank(bob);
+        ourToken.approve(alice, initialAllowance);
+        assertEq(ourToken.allowance(bob, alice), initialAllowance);
+
+        vm.prank(alice);
+        vm.expectEmit(true, true, false, true);
+        emit Transfer(bob, alice, transferAmount);
+        bool ok = ourToken.transferFrom(bob, alice, transferAmount);
+        assertTrue(ok);
+
+        // Balances update
+        assertEq(ourToken.balanceOf(alice), transferAmount);
+        assertEq(ourToken.balanceOf(bob), STARTING_BALANCE - transferAmount);
+
+        // Allowance reduced
+        assertEq(
+            ourToken.allowance(bob, alice),
+            initialAllowance - transferAmount
+        );
+    }
+
+    function test_TransferFromReverts_InsufficientAllowance() public {
+        vm.prank(bob);
+        ourToken.approve(alice, 100);
+
+        vm.prank(alice);
+        vm.expectRevert(bytes("ERC20: insufficient allowance"));
+        ourToken.transferFrom(bob, carol, 101);
+    }
+
+    function test_TransferFromReverts_FromZeroAddress() public {
+        // Call transferFrom with from == zero address should revert via _update()
+        vm.expectRevert(bytes("ERC20: transfer from the zero address"));
+        ourToken.transferFrom(address(0), alice, 1);
+    }
+
+    // --------- Fuzz tests for extra coverage ---------
+
+    function testFuzz_TransferWithinBalance(address to, uint256 amount) public {
+        // Constrain: to != zero, amount within owner's balance
+        vm.assume(to != address(0));
+        uint256 ownerBal = ourToken.balanceOf(owner);
+        vm.assume(amount <= ownerBal);
+
+        uint256 toBefore = ourToken.balanceOf(to);
+
+        bool ok = ourToken.transfer(to, amount);
+        assertTrue(ok);
+
+        assertEq(ourToken.balanceOf(owner), ownerBal - amount);
+        assertEq(ourToken.balanceOf(to), toBefore + amount);
+    }
+
+    function testFuzz_TransferFromSpendsAllowance(
+        address spender,
+        uint256 approveAmt,
+        uint256 spendAmt
+    ) public {
+        // Bob approves spender; spender pulls from bob to carol
+        vm.assume(spender != address(0));
+        vm.assume(spender != bob);
+        vm.assume(spender != carol);
+
+        // Bound values to practical ranges
+        approveAmt = bound(approveAmt, 0, STARTING_BALANCE);
+        spendAmt = bound(spendAmt, 0, STARTING_BALANCE);
+
+        vm.prank(bob);
+        ourToken.approve(spender, approveAmt);
+
+        vm.startPrank(spender);
+        if (spendAmt > approveAmt) {
+            vm.expectRevert(bytes("ERC20: insufficient allowance"));
+            ourToken.transferFrom(bob, carol, spendAmt);
+        } else if (spendAmt > ourToken.balanceOf(bob)) {
+            vm.expectRevert(bytes("ERC20: transfer amount exceeds balance"));
+            ourToken.transferFrom(bob, carol, spendAmt);
+        } else {
+            bool ok = ourToken.transferFrom(bob, carol, spendAmt);
+            assertTrue(ok);
+            assertEq(ourToken.allowance(bob, spender), approveAmt - spendAmt);
+            assertEq(ourToken.balanceOf(carol), spendAmt);
+            assertEq(ourToken.balanceOf(bob), STARTING_BALANCE - spendAmt);
+        }
+        vm.stopPrank();
+    }
+}
